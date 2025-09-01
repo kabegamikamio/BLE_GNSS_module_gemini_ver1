@@ -19,9 +19,9 @@
 #define ADDR_SMA_SIZE 0 // 保存先アドレス
 
 // --- グローバル設定変数 ---
-bool useGpsSpeedSource = false; // true: gps.speed, false: 手動計算
+bool useGpsSpeedSource = true; // true: gps.speed, false: 手動計算
 bool enableSpeedSmoothing = true;
-int smaWindowSize = 7; // 移動平均のサンプル数（デフォルト値）
+int smaWindowSize = 5; // 移動平均のサンプル数（デフォルト値）
 
 // --- 速度計算用のグローバル変数 ---
 double lastLat = 0.0, lastLng = 0.0;
@@ -246,7 +246,7 @@ void loop() {
                 speedKmph = gps.speed.kmph();
             } else {
                 if (enableSpeedSmoothing) {
-                    speedKmph = smoothedSpeedMps * 3.6;
+                    speedKmph = smoothedSpeedMps * 3.6; // 3.6倍する必要があるのか…?
                 } else {
                     speedKmph = calculatedSpeedMps * 3.6;
                 }
