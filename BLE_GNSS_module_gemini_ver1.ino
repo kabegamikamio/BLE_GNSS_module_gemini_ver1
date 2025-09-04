@@ -14,40 +14,31 @@
 #define SERVICE_UUID_CONFIG "c48e6067-5295-48d3-8d5c-0395f61792b1"                 // ESP32やGNSSモジュールの設定に使うサービス
 #define CHARACTERISTIC_UUID_SMA_WINDOW "c48e6068-5295-48d3-8d5c-0395f61792b1"      // 移動平均区間の設定用キャラ
 #define CHARACTERISTIC_UUID_GNSS_RATE "c48e6069-5295-48d3-8d5c-0395f61792b1"       // GNSSの測位頻度設定用キャラ
-#define CHARACTERISTIC_UUID_GNSS_BAUD "c48e606a-5295-48d3-8d5c-0395f61792b1"       // GNSSとの通信に使うボーレートの設定用キャラ
 
 // --- EEPROM Settings ---
 #define EEPROM_SIZE 16  // SMA(1) + Rate(1) + Baud(4) + reserved
 #define ADDR_SMA_SIZE 0
 #define ADDR_GNSS_RATE 1
-#define ADDR_GNSS_BAUD 2  // Baud rate (uint32_t) starts at address 2
 
 // --- グローバル設定変数 ---
-bool useGpsSpeedSource = true;            // 速度のデータソース: 初期値はNMEAから取得する方式(推奨)
-bool enableSpeedSmoothing = true;         // 速度の平滑化: 初期値は有効
 int smaWindowSize = 5;                    // 平滑化の移動平均区間: 初期値は5
-uint32_t currentGpsBaud = 57600;          // GNSSとの通信で使うボーレート: 初期値は57600
+const uint32_t gpsBaud = 115200;          // GNSSとの通信で使うボーレート: 初期値は115200
 int currentGnssRateHz = 10;               // GNSSの測位頻度: 初期値は10Hz
 unsigned long bleNotifyIntervalMs = 100;  // 位置情報の通知頻度(初期値は 1/10 s = 100ms)
-const uint32_t validBaudRates[] = {       // 有効なボーレートの集合
-  9600, 19200, 31250, 38400, 57600, 75880,
-  115200, 230400, 250000, 460800
-};
 
 // --- 速度計算用のグローバル変数 ---
 double lastLat = 0.0, lastLng = 0.0;
 unsigned long lastSpeedCalcMillis = 0;
-float calculatedSpeedKph = 0.0;
 float smoothedSpeedKph = 0.0;
 float *speedSamples = nullptr;
 int currentSampleIndex = 0;
+int filledSamples = 0;
 const int MAX_SMA_WINDOW_SIZE = 50;
 
 // --- BLE ---
 BLECharacteristic *pLocationSpeedCharacteristic;
 BLECharacteristic *pSmaWindowCharacteristic;
 BLECharacteristic *pGnssRateCharacteristic;
-BLECharacteristic *pGnssBaudCharacteristic;
 bool deviceConnected = false;
 unsigned long lastGpsCheck = 0;
 
@@ -79,7 +70,6 @@ HardwareSerial gpsSerial(1);
 void setSmaWindowSize(int newSize);
 void sendUb(byte *ubloxCommand, size_t len);
 bool setGnssRate(int newRateHz);
-bool setGpsBaudRate(uint32_t newBaudRate);
 void saveGnssConfig();
 
 // --- BLE Callbacks ---
@@ -109,7 +99,7 @@ class SmaConfigCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-// 測位頻度とボーレート更新時のコールバック
+// 測位頻度更新時のコールバック
 class GnssConfigCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     String value = pCharacteristic->getValue();
@@ -126,41 +116,30 @@ class GnssConfigCallbacks : public BLECharacteristicCallbacks {
 
     if (pCharacteristic == pGnssRateCharacteristic) {
       if (setGnssRate((int)receivedValue)) {
-        saveGnssConfig();
         pGnssRateCharacteristic->setValue(String(currentGnssRateHz).c_str());
-      }
-    } else if (pCharacteristic == pGnssBaudCharacteristic) {
-      if (setGpsBaudRate(receivedValue)) {
-        saveGnssConfig();
-        pGnssBaudCharacteristic->setValue(String(currentGpsBaud).c_str());
       }
     }
   }
 };
 
 // --- 関数定義 ---
-// GxRMC, GxVTGの速度を使わず、ESP32自前で速度を計算する関数(非推奨)
-void updateCalculatedSpeed() {
-  if (gps.location.isValid() && gps.location.isUpdated()) {
-    if (lastLat != 0.0 && lastLng != 0.0) {
-      double distanceMeters = TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), lastLat, lastLng);
-      unsigned long currentMillis = millis();
-      double timeSeconds = (double)(currentMillis - lastSpeedCalcMillis) / 1000.0;
-      if (timeSeconds > 0) calculatedSpeedKph = distanceMeters / timeSeconds * 3.6;  // 3.6をかけて[m/s]から[km/h]に変換
-    }
-    lastLat = gps.location.lat();
-    lastLng = gps.location.lng();
-    lastSpeedCalcMillis = millis();
-  }
-}
 
 // 移動平均を使って速度を平滑化
 void updateSmoothedSpeed(float rawSpeedKph) {
-  if (enableSpeedSmoothing && speedSamples != nullptr && smaWindowSize > 0) {
+  // 平滑化が有効になっていても移動平均区間が0に設定されてしまっている場合は生速度を返す
+  if (smaWindowSize == 0) {
+    smoothedSpeedKph = rawSpeedKph;
+  }
+
+  if (speedSamples != nullptr && smaWindowSize > 0) {
     speedSamples[currentSampleIndex] = rawSpeedKph;
     currentSampleIndex = (currentSampleIndex + 1) % smaWindowSize;
+
+    // バッファ未充填のときは、充填されたぶんの速度だけで平均を計算
+    if (filledSamples < smaWindowSize) filledSamples++;
+
     float sum = 0.0;
-    for (int i = 0; i < smaWindowSize; i++) {
+    for (int i = 0; i < filledSamples; i++) {
       sum += speedSamples[i];
     }
     smoothedSpeedKph = sum / smaWindowSize;
@@ -171,26 +150,27 @@ void updateSmoothedSpeed(float rawSpeedKph) {
 void setSmaWindowSize(int newSize) {
   if (newSize < 0) return;
   if (newSize > MAX_SMA_WINDOW_SIZE) newSize = MAX_SMA_WINDOW_SIZE;
-  if ((newSize == 0 && !enableSpeedSmoothing) || (newSize == smaWindowSize && enableSpeedSmoothing && newSize != 0)) return;
 
   if (newSize == 0) {
-    enableSpeedSmoothing = false;
     if (speedSamples != nullptr) {
       delete[] speedSamples;
       speedSamples = nullptr;
     }
     Serial.println("Speed smoothing DISABLED.");
   } else {
-    enableSpeedSmoothing = true;
-    if (newSize != smaWindowSize || speedSamples == nullptr) {
-      if (speedSamples != nullptr) delete[] speedSamples;
-      speedSamples = new float[newSize];
-      for (int i = 0; i < newSize; i++) speedSamples[i] = 0.0;
-      currentSampleIndex = 0;
-      smoothedSpeedKph = 0.0;
-    }
+    if (speedSamples != nullptr) delete[] speedSamples;
+
+    speedSamples = new float[newSize];
+
+    for (int i = 0; i < newSize; i++) speedSamples[i] = 0.0;
+
+    currentSampleIndex = 0;
+    filledSamples = 0;
+    smoothedSpeedKph = 0.0;
+
     Serial.printf("Speed smoothing ENABLED with window size: %d\n", newSize);
   }
+
   smaWindowSize = newSize;
   EEPROM.write(ADDR_SMA_SIZE, smaWindowSize);
   EEPROM.commit();
@@ -237,6 +217,8 @@ bool setGnssRate(int newRateHz) {
   ubxCfgRate[6] = (uint16_t)bleNotifyIntervalMs & 0xFF;
   ubxCfgRate[7] = ((uint16_t)bleNotifyIntervalMs >> 8) & 0xFF;
   sendUb(ubxCfgRate, sizeof(ubxCfgRate));
+  delay(150);
+  saveGnssConfig();
 
   Serial.printf("BLE notify interval updated to %lu ms.\n", bleNotifyIntervalMs);
   Serial.println("Saved new Rate setting to EEPROM.");
@@ -244,52 +226,18 @@ bool setGnssRate(int newRateHz) {
   return true;
 }
 
-// モジュールとのボーレートを変更する
-bool setGpsBaudRate(uint32_t newBaudRate) {
-  bool isValid = false;
-
-  // 入力されたボーレートが有効か検証する
-  for (uint32_t rate : validBaudRates) {
-    if (newBaudRate == rate) {
-      isValid = true;
-      break;
-    }
-  }
-
-  // 有効でない場合
-  if (!isValid) {
-    Serial.printf("Invalid baud rate: %u bps.\n", newBaudRate);
-    return false;
-  }
-
-  // UBXパケットの設定
-  Serial.printf("Attempting to change baud rate to %u bps...\n", newBaudRate);
-  byte ubxCfgPrt[] = { 0xB5, 0x62, 0x06, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0xD0, 0x08, 0x00, 0x00,
-                       0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00 };
-  ubxCfgPrt[14] = newBaudRate & 0xFF;
-  ubxCfgPrt[15] = (newBaudRate >> 8) & 0xFF;
-  ubxCfgPrt[16] = (newBaudRate >> 16) & 0xFF;
-  ubxCfgPrt[17] = (newBaudRate >> 24) & 0xFF;
-
-  // ボーレート変更命令を送り、新しいボーレートで通信を確立
-  sendUb(ubxCfgPrt, sizeof(ubxCfgPrt));
-  gpsSerial.flush();
-  delay(100);
-  gpsSerial.updateBaudRate(newBaudRate);
-
-  // ESP32側でもボーレートを変更
-  currentGpsBaud = newBaudRate;
-  EEPROM.put(ADDR_GNSS_BAUD, currentGpsBaud);
-  EEPROM.commit();
-  Serial.println("Saved new Baud Rate setting to EEPROM.");
-
-  return true;
-}
-
 // CFG命令を送る
 void saveGnssConfig() {
   Serial.println("Saving configuration to GNSS receiver's BBR/Flash...");
-  byte ubxCfgCfg[] = { 0xB5, 0x62, 0x06, 0x09, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00 };
+  byte ubxCfgCfg[] = {
+    0xB5, 0x62, 0x06, 0x09, 0x0D, 0x00,  // Header
+    0x00, 0x00, 0x00, 0x00,              // clearMask = 0
+    0xFF, 0xFF,                          // saveMask = 0xFFFF（全項目保存）
+    0x00, 0x00,                          // loadMask = 0
+    0x03, 0x00, 0x00,                    // deviceMask = 0 ←ここが問題
+    0x17, 0x00, 0x00                     // CRC placeholder
+  };
+
   sendUb(ubxCfgCfg, sizeof(ubxCfgCfg));
   delay(100);
 }
@@ -298,6 +246,8 @@ void saveGnssConfig() {
 void setup() {
   Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
+
+  delay(250);
 
   // --- EEPROMから設定を読み込み ---
   // 移動平均の設定
@@ -312,25 +262,10 @@ void setup() {
   Serial.printf("Loaded GNSS Rate from EEPROM: %d Hz\n", currentGnssRateHz);
   bleNotifyIntervalMs = 1000 / currentGnssRateHz;
 
-  // ボーレートの設定
-  EEPROM.get(ADDR_GNSS_BAUD, currentGpsBaud);
-  bool isValidBaud = false;
-  for (uint32_t rate : validBaudRates) {  // 有効なボーレートか検証
-    if (currentGpsBaud == rate) {
-      isValidBaud = true;
-      break;
-    }
-  }
-  if (!isValidBaud) {
-    currentGpsBaud = 57600;
-    Serial.println("No valid Baud Rate in EEPROM. Using default.");
-  }
-  Serial.printf("Loaded Baud Rate from EEPROM: %u bps\n", currentGpsBaud);
-
   // GNSSモジュールとの通信開始
   Serial.println("\n🚀 Starting BLE GNSS module v2...");
-  gpsSerial.begin(currentGpsBaud, SERIAL_8N1, RX_PIN, TX_PIN);
-  Serial.printf("🛰️  GPS Serial started at %u baud on RX:%d, TX:%d.\n", currentGpsBaud, RX_PIN, TX_PIN);
+  gpsSerial.begin(gpsBaud, SERIAL_8N1, RX_PIN, TX_PIN);
+  Serial.printf("🛰️  GPS Serial started at %u baud on RX:%d, TX:%d.\n", gpsBaud, RX_PIN, TX_PIN);
 
   // BLEデバイスの設定を開始
   BLEDevice::init(nameBLE.c_str());
@@ -359,11 +294,6 @@ void setup() {
   pGnssRateCharacteristic->setCallbacks(new GnssConfigCallbacks());
   pGnssRateCharacteristic->setValue(String(currentGnssRateHz).c_str());
 
-  // ボーレート設定キャラの初期化
-  pGnssBaudCharacteristic = pConfigService->createCharacteristic(CHARACTERISTIC_UUID_GNSS_BAUD, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-  pGnssBaudCharacteristic->setCallbacks(new GnssConfigCallbacks());
-  pGnssBaudCharacteristic->setValue(String(currentGpsBaud).c_str());
-
   pConfigService->start();
 
   // アドバタイジングの設定
@@ -388,14 +318,7 @@ void loop() {
     if (input.endsWith("Hz")) {  // 測位頻度設定
       int newRate = input.substring(0, input.length() - 2).toInt();
       if (setGnssRate(newRate)) {
-        saveGnssConfig();
         pGnssRateCharacteristic->setValue(String(currentGnssRateHz).c_str());
-      }
-    } else if (input.endsWith("bps")) {  // ボーレート設定
-      uint32_t newBaud = input.substring(0, input.length() - 3).toInt();
-      if (setGpsBaudRate(newBaud)) {
-        saveGnssConfig();
-        pGnssBaudCharacteristic->setValue(String(currentGpsBaud).c_str());
       }
     } else {  // 移動平均区間設定
       int newSize = input.toInt();
@@ -411,12 +334,7 @@ void loop() {
     if (gps.encode(gpsSerial.read())) {
       // まず、どちらかのソースから生の速度(km/h)を取得する
       float rawSpeedKph = 0.0;
-      if (useGpsSpeedSource) {
-        rawSpeedKph = gps.speed.kmph();
-      } else {
-        updateCalculatedSpeed();  // 手動計算を実行
-        rawSpeedKph = calculatedSpeedKph;
-      }
+      rawSpeedKph = gps.speed.kmph();
       // 次に、平滑化が有効なら、生の速度を元に平滑化を行う
       updateSmoothedSpeed(rawSpeedKph);
     }
@@ -434,11 +352,11 @@ void loop() {
       loc_data.flags = 0b0000000001000101;
 
       float speedKmph = 0.0;
-      if (enableSpeedSmoothing) {
+      if (smaWindowSize > 0) {
         speedKmph = smoothedSpeedKph;
       } else {
-        // 平滑化が無効なときは、選択されたソースの生速度を使用
-        speedKmph = useGpsSpeedSource ? gps.speed.kmph() : calculatedSpeedKph;
+        // 平滑化が無効なときは、生速度を使用
+        speedKmph = gps.speed.kmph();
       }
 
       loc_data.instantaneousSpeed = (uint16_t)(speedKmph * 100.0);
